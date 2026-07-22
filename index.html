@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLE→Firebase 中継 (Bluefy用)</title>
+<style>
+  body {
+    font-family: -apple-system, sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+    padding: 16px;
+  }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 20px; }
+  button {
+    font-size: 16px;
+    padding: 12px 20px;
+    border-radius: 8px;
+    border: none;
+    margin-right: 8px;
+    margin-bottom: 16px;
+  }
+  #connectBtn { background: #2d7; color: #000; }
+  #disconnectBtn { background: #d55; color: #fff; }
+  button:disabled { background: #444; color: #888; }
+
+  .card {
+    background: #1c1c1c;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+  }
+  .row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 15px; }
+  .label { color: #999; }
+  .value { font-weight: 600; }
+  .ok { color: #4d4; }
+  .ng { color: #e55; }
+
+  #log {
+    background: #000;
+    color: #7f7;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 10px;
+    height: 160px;
+    overflow-y: auto;
+    border-radius: 8px;
+    white-space: pre-wrap;
+  }
+
+  .settings { font-size: 13px; color: #aaa; margin-top: 10px; }
+  .settings input { width: 60px; }
+</style>
+</head>
+<body>
+
+<h1>BLE → Firebase 中継</h1>
+<div class="sub">M5Stick(BLE)から座標を受信し、モバイル通信でFirebaseに送ります</div>
+
+<button id="connectBtn">BLEに接続</button>
+<button id="disconnectBtn" disabled>切断</button>
+
+<div class="card">
+  <div class="row"><span class="label">BLE接続</span><span id="bleStatus" class="value ng">未接続</span></div>
+  <div class="row"><span class="label">緯度</span><span id="lat" class="value">-</span></div>
+  <div class="row"><span class="label">経度</span><span id="lng" class="value">-</span></div>
+  <div class="row"><span class="label">速度</span><span id="spd" class="value">-</span></div>
+  <div class="row"><span class="label">Firebase送信</span><span id="fbStatus" class="value">-</span></div>
+</div>
+
+<div class="settings">
+  Firebase送信間隔の間引き(1=毎回, 2=1回おき...):
+  <input id="throttleInput" type="number" min="1" value="1">
+  <button id="applyThrottleBtn" style="padding:4px 10px; font-size:13px;">適用</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+// ==========================================
+// 【現場調整用】設定
+// ==========================================
+// M5Stick側スケッチのUUIDと必ず一致させること
+const SERVICE_UUID    = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const COORD_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+// M5Stick側スケッチのCAR_IDと一致させること
+const CAR_ID = "Car_002";
+
+// FirebaseベースURL(M5Stick側スケッチと同じもの)
+const FIREBASE_BASE_URL = "https://live-tracking-no-iphone-001-default-rtdb.asia-southeast1.firebasedatabase.app/";
+
+// 走行中のコース名。地図側(current_status/circuit)の変更をリアルタイム監視して
+// 自動で追従する(下のstartCircuitWatcher参照)。地図側が一度も開かれていない・
+// 書き込まれていない場合は"public_road"のまま動く。
+let currentCircuitName = "public_road";
+
+// Firebase送信を間引く場合の設定(1=BLE Notifyのたびに毎回送信=5Hz)
+let sendEveryN = 1;
+let notifyCounter = 0;
+
+// ==========================================
+// 状態
+// ==========================================
+let bleDevice = null;
+let bleServer = null;
+let coordCharacteristic = null;
+
+const $ = (id) => document.getElementById(id);
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent = `[${t}] ${msg}\n` + $("log").textContent;
+}
+
+function setBleStatus(connected) {
+  const el = $("bleStatus");
+  el.textContent = connected ? "接続中" : "未接続";
+  el.className = "value " + (connected ? "ok" : "ng");
+  $("connectBtn").disabled = connected;
+  $("disconnectBtn").disabled = !connected;
+}
+
+function setFbStatus(text, ok) {
+  const el = $("fbStatus");
+  el.textContent = text;
+  el.className = "value " + (ok ? "ok" : "ng");
+}
+
+// ==========================================
+// コース(サーキット)監視
+// Firebase RTDBのREST APIは、GETリクエストのAcceptヘッダをtext/event-streamに
+// すると、その後の変更をリアルタイムでプッシュしてくれる(EventSourceが自動でこの
+// ヘッダを付ける)。ポーリングではなくこちらを使うことで、地図側でサーキットを
+// 選んだ瞬間に検知でき、かつ無駄な通信も発生しない。
+// ==========================================
+let circuitEventSource = null;
+
+function startCircuitWatcher() {
+  const url = `${FIREBASE_BASE_URL}current_status/circuit.json`;
+  circuitEventSource = new EventSource(url);
+
+  // 接続確立時、及び値が変わるたびに"put"イベントが飛んでくる
+  circuitEventSource.addEventListener("put", (event) => {
+    try {
+      const payload = JSON.parse(event.data); // { path: "/", data: "suzuka" } のような形
+      if (payload.path === "/" && typeof payload.data === "string" && payload.data.length > 0) {
+        if (payload.data !== currentCircuitName) {
+          log(`コース変更を検知: ${currentCircuitName} → ${payload.data}`);
+          currentCircuitName = payload.data;
+        }
+      }
+    } catch (e) {
+      log("コース監視イベントの解析に失敗: " + e);
+    }
+  });
+
+  circuitEventSource.onerror = () => {
+    // EventSourceは切断されてもブラウザが自動的に再接続を試みてくれる
+    log("コース監視の接続が不安定です(自動で再接続を試みます)");
+  };
+
+  log("コース監視(current_status/circuit)を開始しました");
+}
+
+// ==========================================
+// BLE接続
+// ==========================================
+async function connectBle() {
+  try {
+    log("デバイスを検索します...");
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+
+    bleDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log(`デバイス選択: ${bleDevice.name || "(名称なし)"}`);
+    bleServer = await bleDevice.gatt.connect();
+
+    const service = await bleServer.getPrimaryService(SERVICE_UUID);
+    coordCharacteristic = await service.getCharacteristic(COORD_CHAR_UUID);
+
+    await coordCharacteristic.startNotifications();
+    coordCharacteristic.addEventListener("characteristicvaluechanged", onCoordNotify);
+
+    setBleStatus(true);
+    log("接続完了。座標のNotify待受を開始しました");
+  } catch (err) {
+    log("接続失敗: " + err);
+    setBleStatus(false);
+  }
+}
+
+function disconnectBle() {
+  if (bleDevice && bleDevice.gatt.connected) {
+    bleDevice.gatt.disconnect();
+  }
+}
+
+function onDisconnected() {
+  setBleStatus(false);
+  log("BLEが切断されました。「BLEに接続」から再接続してください");
+  // 【注意】iOS/Bluefyの制約上、requestDevice()はユーザー操作(ボタン押下)が
+  // 必要なため、切断後の自動再接続はできない。手動での再タップを促す。
+}
+
+// ==========================================
+// M5Stick側パケット形式(16byte, little-endian):
+//   float32 lat, float32 lng, float32 speedKmph, uint32 timeMs
+// ==========================================
+function onCoordNotify(event) {
+  const dv = event.target.value; // DataView
+  if (dv.byteLength < 16) {
+    log(`パケットサイズ異常: ${dv.byteLength}byte`);
+    return;
+  }
+
+  const lat = dv.getFloat32(0, true);
+  const lng = dv.getFloat32(4, true);
+  const speedKmph = dv.getFloat32(8, true);
+  const deviceTimeMs = dv.getUint32(12, true);
+
+  $("lat").textContent = lat.toFixed(6);
+  $("lng").textContent = lng.toFixed(6);
+  $("spd").textContent = speedKmph.toFixed(1) + " km/h";
+
+  notifyCounter++;
+  if (notifyCounter % sendEveryN !== 0) return;
+
+  sendToFirebase(lat, lng, speedKmph, deviceTimeMs);
+}
+
+// ==========================================
+// Firebaseへの送信(モバイル通信・fetch経由)
+// ==========================================
+async function sendToFirebase(lat, lng, speedKmph, deviceTimeMs) {
+  const url = `${FIREBASE_BASE_URL}${currentCircuitName}/live/${CAR_ID}.json`;
+  // 【重要】Firebase側のルールで live/$car_id 配下は
+  // lat / lng / speed / time 以外のキーを許可していない($other: validate false)。
+  // 以前ここに device_time を混ぜていたためルール違反で401(Permission Denied)になっていた。
+  // M5Stick側で取得した時刻(deviceTimeMs)はログ表示にのみ使い、Firebaseには送らない。
+  const payload = {
+    lat: lat,
+    lng: lng,
+    speed: speedKmph,
+    time: Date.now()          // 送信元(iPhone)側の時刻
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (res.ok) {
+      setFbStatus("送信OK", true);
+    } else {
+      setFbStatus(`失敗 (${res.status})`, false);
+      log(`Firebase送信失敗: status=${res.status}`);
+    }
+  } catch (err) {
+    setFbStatus("送信エラー", false);
+    log("Firebase送信エラー: " + err);
+  }
+}
+
+// ==========================================
+// UIイベント
+// ==========================================
+$("connectBtn").addEventListener("click", connectBle);
+$("disconnectBtn").addEventListener("click", disconnectBle);
+$("applyThrottleBtn").addEventListener("click", () => {
+  const v = parseInt($("throttleInput").value, 10);
+  sendEveryN = (v && v > 0) ? v : 1;
+  log(`Firebase送信間引きを ${sendEveryN} 回に1回 に設定しました`);
+});
+
+if (!navigator.bluetooth) {
+  log("このブラウザはWeb Bluetoothに対応していません(Bluefyで開いてください)");
+}
+
+// BLE接続の有無に関わらず、ページを開いたらすぐにコース監視を開始しておく
+// (先にコースを合わせておいてからBLE接続する運用でも、後からBLE接続する
+//  運用でも、どちらでも取りこぼしがないようにするため)
+startCircuitWatcher();
+</script>
+
+</body>
+</html>
