@@ -70,6 +70,12 @@
   <div class="row"><span class="label">Firebase送信</span><span id="fbStatus" class="value">-</span></div>
 </div>
 
+<div class="card">
+  <div class="row"><span class="label">最終BLE受信</span><span id="lastNotifyAge" class="value">-</span></div>
+  <div class="row"><span class="label">最終送信成功</span><span id="lastSendAge" class="value">-</span></div>
+  <div class="row"><span class="label">コース監視</span><span id="circuitWatcherStatus" class="value">-</span></div>
+</div>
+
 <div class="settings">
   Firebase送信間隔の間引き(1=毎回, 2=1回おき...):
   <input id="throttleInput" type="number" min="1" value="1">
@@ -87,7 +93,7 @@ const SERVICE_UUID    = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const COORD_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 
 // M5Stick側スケッチのCAR_IDと一致させること
-const CAR_ID = "Car_002";
+const CAR_ID = "Car_001";
 
 // FirebaseベースURL(M5Stick側スケッチと同じもの)
 const FIREBASE_BASE_URL = "https://live-tracking-no-iphone-001-default-rtdb.asia-southeast1.firebasedatabase.app/";
@@ -107,6 +113,16 @@ let notifyCounter = 0;
 let bleDevice = null;
 let bleServer = null;
 let coordCharacteristic = null;
+
+// --- ゾンビ接続（見た目は正常だが実際には止まっている）対策のウォッチドッグ ---
+// 「BLE接続中」「送信OK」といった表示は、それぞれの最後の成功時点のまま
+// 更新が止まっていても文字面は変わらないため、現地で見ても正常に見えてしまう
+// ことがあった。実際に最後にデータが動いたのがいつかを常時計測して表示し、
+// 一定時間動きが無ければ赤く警告することで「本当に生きているか」を
+// 一目で判断できるようにする。
+let lastNotifyRealTime = null;   // 最後にBLE Notifyを受け取った時刻
+let lastSendSuccessRealTime = null; // 最後にFirebase送信が成功した時刻
+const STALE_WARN_MS = 3000; // 5Hz(200ms間隔)前提なら3秒も来なければ明らかに異常
 
 const $ = (id) => document.getElementById(id);
 
@@ -162,6 +178,10 @@ function startCircuitWatcher() {
     log("コース監視の接続が不安定です(自動で再接続を試みます)");
   };
 
+  circuitEventSource.onopen = () => {
+    log("コース監視の接続が確立/復帰しました");
+  };
+
   log("コース監視(current_status/circuit)を開始しました");
 }
 
@@ -212,6 +232,8 @@ function onDisconnected() {
 //   float32 lat, float32 lng, float32 speedKmph, uint32 timeMs
 // ==========================================
 function onCoordNotify(event) {
+  lastNotifyRealTime = Date.now();
+
   const dv = event.target.value; // DataView
   if (dv.byteLength < 16) {
     log(`パケットサイズ異常: ${dv.byteLength}byte`);
@@ -230,41 +252,97 @@ function onCoordNotify(event) {
   notifyCounter++;
   if (notifyCounter % sendEveryN !== 0) return;
 
-  sendToFirebase(lat, lng, speedKmph, deviceTimeMs);
+  queueForSend(lat, lng, speedKmph);
 }
 
 // ==========================================
 // Firebaseへの送信(モバイル通信・fetch経由)
+//
+// 【重要】以前は BLE Notify のたびに sendToFirebase() を await せず毎回
+// 新規に呼んでいたため、モバイル回線が一瞬でも遅くなると(電波が弱い場所、
+// トンネル際など)、複数のfetchリクエストが同時に飛んだ状態になり、
+// それらがバラバラの順番でFirebaseに届く(＝レースコンディション)ことが
+// あった。受信側の地図では、これが「まとまって届く→しばらく途切れる」
+// という不規則なバーストとして見え、地図側でどれだけ補間しても直せない
+// 種類のカクつき・ジャンプの原因になっていた。
+//
+// 対策として、常に「今わかっている最新の1点だけ」を送るキュー方式にする。
+// - 送信中(sendInFlight=true)に次のBLE Notifyが来ても、新しいリクエストは
+//   発行せず、pendingPayloadを最新の値で上書きするだけにする
+// - 送信が完了したら、そのとき待っている最新の位置だけを続けて送る
+// これにより通信は常に1本ずつ・順序通りに送られ、回線が一時的に遅くても
+// リクエストが積み上がったり順番が入れ替わったりしなくなる。
 // ==========================================
-async function sendToFirebase(lat, lng, speedKmph, deviceTimeMs) {
-  const url = `${FIREBASE_BASE_URL}${currentCircuitName}/live/${CAR_ID}.json`;
+let sendInFlight = false;
+let pendingPayload = null;
+
+function queueForSend(lat, lng, speedKmph) {
   // 【重要】Firebase側のルールで live/$car_id 配下は
   // lat / lng / speed / time 以外のキーを許可していない($other: validate false)。
   // 以前ここに device_time を混ぜていたためルール違反で401(Permission Denied)になっていた。
   // M5Stick側で取得した時刻(deviceTimeMs)はログ表示にのみ使い、Firebaseには送らない。
-  const payload = {
+  pendingPayload = {
     lat: lat,
     lng: lng,
     speed: speedKmph,
     time: Date.now()          // 送信元(iPhone)側の時刻
   };
 
+  if (!sendInFlight) {
+    flushPending();
+  }
+}
+
+async function flushPending() {
+  if (!pendingPayload) return;
+  const payload = pendingPayload;
+  pendingPayload = null;
+  sendInFlight = true;
+
+  const startPerf = performance.now();
+  const url = `${FIREBASE_BASE_URL}${currentCircuitName}/live/${CAR_ID}.json`;
+
+  // 【重要】タイムアウトを必ず設ける。
+  // iOSがアプリをバックグラウンドで一時停止させた場合など、fetch()のPromiseが
+  // 成功も失敗もしないまま止まってしまうことがある。その場合、下のtry/catch/finally
+  // すら永遠に実行されず、sendInFlightがtrueに固定されたまま二度と送信できなく
+  // なる（見た目は「送信OK」のまま止まる、という一番厄介な壊れ方をする）。
+  // AbortControllerで強制的に打ち切ることで、必ずcatchブロックに落として
+  // sendInFlightを解放できるようにする。
+  const FETCH_TIMEOUT_MS = 5000;
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), FETCH_TIMEOUT_MS);
+
   try {
     const res = await fetch(url, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: abortController.signal
     });
 
+    const rttMs = Math.round(performance.now() - startPerf);
     if (res.ok) {
-      setFbStatus("送信OK", true);
+      lastSendSuccessRealTime = Date.now();
+      setFbStatus(`送信OK (${rttMs}ms)`, true);
     } else {
       setFbStatus(`失敗 (${res.status})`, false);
       log(`Firebase送信失敗: status=${res.status}`);
     }
   } catch (err) {
     setFbStatus("送信エラー", false);
-    log("Firebase送信エラー: " + err);
+    if (err.name === "AbortError") {
+      log(`Firebase送信タイムアウト(${FETCH_TIMEOUT_MS}ms超過、強制打ち切り)`);
+    } else {
+      log("Firebase送信エラー: " + err);
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    sendInFlight = false;
+    // 送信中に新しい位置が来ていれば、続けてそれを送る(常に1本ずつ)
+    if (pendingPayload) {
+      flushPending();
+    }
   }
 }
 
@@ -282,6 +360,48 @@ $("applyThrottleBtn").addEventListener("click", () => {
 if (!navigator.bluetooth) {
   log("このブラウザはWeb Bluetoothに対応していません(Bluefyで開いてください)");
 }
+
+// --- ウォッチドッグ表示の更新(1秒ごと) ---
+// 「BLE接続」「Firebase送信」の表示は最後の成功時のまま止まっていても
+// 見た目上は正常に見えてしまうため、実際に最後に動いたのがいつかを
+// 常に計算し直して表示する。一定時間(STALE_WARN_MS)動きが無ければ赤くする。
+function formatAge(realTime) {
+  if (realTime === null) return "-";
+  const elapsedMs = Date.now() - realTime;
+  if (elapsedMs < 1000) return "たった今";
+  return `${(elapsedMs / 1000).toFixed(0)}秒前`;
+}
+
+setInterval(() => {
+  const notifyEl = $("lastNotifyAge");
+  const sendEl = $("lastSendAge");
+
+  notifyEl.textContent = formatAge(lastNotifyRealTime);
+  const notifyStale = lastNotifyRealTime === null || (Date.now() - lastNotifyRealTime) > STALE_WARN_MS;
+  notifyEl.className = "value " + (notifyStale ? "ng" : "ok");
+
+  sendEl.textContent = formatAge(lastSendSuccessRealTime);
+  const sendStale = lastSendSuccessRealTime === null || (Date.now() - lastSendSuccessRealTime) > STALE_WARN_MS;
+  sendEl.className = "value " + (sendStale ? "ng" : "ok");
+
+  // コース監視は「putイベントが来ない」＝コースが変わっていないだけの正常な
+  // 状態でも起こるため、経過時間ではなくEventSource自体の接続状態(readyState)
+  // を直接見て判定する。
+  const circuitEl = $("circuitWatcherStatus");
+  if (!circuitEventSource) {
+    circuitEl.textContent = "未起動";
+    circuitEl.className = "value ng";
+  } else if (circuitEventSource.readyState === EventSource.OPEN) {
+    circuitEl.textContent = "接続中";
+    circuitEl.className = "value ok";
+  } else if (circuitEventSource.readyState === EventSource.CONNECTING) {
+    circuitEl.textContent = "再接続中...";
+    circuitEl.className = "value ng";
+  } else {
+    circuitEl.textContent = "切断";
+    circuitEl.className = "value ng";
+  }
+}, 1000);
 
 // BLE接続の有無に関わらず、ページを開いたらすぐにコース監視を開始しておく
 // (先にコースを合わせておいてからBLE接続する運用でも、後からBLE接続する
